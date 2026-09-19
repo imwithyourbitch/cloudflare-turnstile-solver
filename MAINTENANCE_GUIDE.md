@@ -6,7 +6,6 @@
 
 This repository is a Rust, request-oriented research implementation. The upstream README explicitly says that it is outdated and no longer works. It contains no WAF implementation, and a Turnstile token is not equivalent to WAF approval: Cloudflare evaluates the complete request, session, client, and site configuration independently.
 
-The maintenance objective should therefore be **reproducible analysis and compatibility testing in a controlled lab**, not a promise that arbitrary third-party challenges can be solved.
 
 ## 2. Repository architecture
 
@@ -22,6 +21,145 @@ src/
 ```
 
 The public crate surface is declared in `src/lib.rs`. `TurnstileSolver` in `src/solver/mod.rs` loads fingerprint fixtures from `workspace/cloudflare_test.json`, creates a `TurnstileTask`, and `task.rs` coordinates challenge retrieval, JavaScript analysis, payload construction, and response processing.
+
+**Current Status**: Out of date. Cloudflare frequently updates obfuscation, VM bytecode, and payload formats. This guide helps update it.
+### High-Level Flow
+``
+1. User provides: site_key + referrer URL
+                    ↓
+2. TurnstileSolver creates task with fingerprint
+                    ↓
+3. TaskClient fetches Cloudflare challenge JS
+                    ↓
+4. Deobfuscator parses & transforms JS
+                    ↓
+5. PayloadKeyExtractor identifies required payload keys
+                    ↓
+6. Parser extracts VM bytecode & magic bits
+                    ↓
+7. Disassembler converts bytecode → instructions
+                    ↓
+8. VMParser interprets instructions → token generation logic
+                    ↓
+9. Task solver generates fingerprint data
+                    ↓
+10. Encryption XOR-encodes response
+                    ↓
+11. Token submitted → Cloudflare validates
+
+### Core Modules
+
+#### 1. **`solver/`** - Main solver orchestration
+- **`mod.rs`**: Entry point `TurnstileSolver`, loads fingerprints, creates tasks
+- **`task.rs`** (27KB): Central orchestrator - coordinates deobfuscation, parsing, VM execution
+- **`task_client.rs`** (21KB): HTTP client for Cloudflare communication, fetches challenge JS
+- **`challenge.rs`**: Challenge options & metadata handling
+- **`vm_parser.rs`** (35KB): Parses VM bytecode, executes instructions, generates tokens
+- **`user_fingerprint.rs`**: Browser fingerprint simulation (TLS, headers, timings)
+- **`performance.rs`**: Fake performance timing data
+- **`timezone/`**: Timezone detection & spoofing
+- **`keys.rs`**: Manages payload key extraction & encryption keys
+- **`utils.rs`**: Helper functions
+- **`entries/`**: Fingerprint entry handlers (eval errors, etc.)
+
+#### 2. **`deobfuscator/`** - JavaScript un-obfuscation
+- **`mod.rs`**: Main pipeline coordinator
+- **`transformers/`**: Individual obfuscation reversal modules
+  - **`strings.rs`**: Decode string arrays (split delimiters, numeric lookups)
+  - **`control_flow_flattening.rs`**: Unflatten for/switch patterns
+  - **`proxy_functions.rs`**: Remove function indirection layers
+  - **`sequence_expressions.rs`**: Break comma-separated expressions into statements
+  - **`normalize_conditionals.rs`**: Simplify if/else chains
+  - **`useless_if.rs`**: Remove dead code
+  - **`numbers.rs`**: Simplify numeric literals
+
+#### 3. **`parser/`** - Payload & bytecode extraction
+- **`mod.rs`**: Module declaration
+- **`payload.rs`**: Identifies required payload keys from JS (browser keys, initial state)
+- **`magic_bits.rs`** (24KB): Extracts opcode/magic bits from bytecode
+- **`vm.rs`**: Locates VM bytecode in obfuscated code
+- **`functions.rs`**: Function signature extraction
+- **`offset.rs`**: Calculates offsets within bytecode
+- **`utils.rs`**: Parsing utilities
+
+#### 4. **`disassembler/`** - Bytecode → instructions
+- **`mod.rs`** (30KB): Main disassembly logic, converts raw bytecode into `Instruction` objects
+- **`instructions.rs`** (10KB): Instruction enum definitions, opcode mappings
+- **`disassemble.rs`**: Entry point for disassembly
+
+#### 5. **`reverse/`** - Encryption & reversal
+- **`encryption.rs`**: XOR-based encryption/decryption
+  - `CloudflareXorEncryption`: Encrypts request payload
+  - `decrypt_cloudflare_response()`: Decrypts server response
+- **Other files**: Compression, compression detection
+
+#### 6. **`decompiler/`** - (Unused, likely for debugging)
+
+---
+
+## How to Update When Cloudflare Changes
+
+Cloudflare updates Turnstile roughly **every 2-8 weeks**. Here's what changes and how to detect/fix it:
+
+### Common Changes & Detection
+
+| Change Type | How Cloudflare Changes It | How to Detect | Fix Strategy |
+|---|---|---|---|
+| **String Obfuscation** | Changes split delimiter ("~" → "|"), array format | Deobfuscator fails to decode strings, JS remains garbled | Update `strings.rs` transformer: change split pattern |
+| **Control Flow** | Changes for/switch flattening pattern | `control_flow_flattening.rs` fails to match pattern | Inspect raw bytecode, update regex/parsing logic |
+| **Proxy Functions** | Adds wrapper layers, changes indirection naming | Function calls still wrapped after deobfuscation | Extend `proxy_functions.rs` visitor patterns |
+| **VM Bytecode Format** | Changes opcode values, adds new instructions | Disassembler produces incorrect instructions | Update `instructions.rs` opcode mappings |
+| **Payload Keys** | Adds/removes required fingerprint keys | Token submission fails with "missing field" errors | Update `payload.rs` key extraction logic |
+| **Encryption** | Changes XOR key format or algorithm | Encrypted payload is invalid | Inspect network traffic, update `encryption.rs` |
+| **Fingerprint Requirements** | Adds new TLS fields, header checks, timing validation | Token rejected even with correct payload | Update `user_fingerprint.rs` |
+
+### Step-by-Step Update Process
+
+#### **Phase 1: Detect the Change**
+
+1. **Fetch current Turnstile JS** from a test page:
+   ```bash
+   curl -s "https://challenges.cloudflare.com/turnstile/v0/api.js" > turnstile.js
+   ```
+
+2. **Try running the existing solver**:
+   ```bash
+   cargo run --bin solve_test --release
+   ```
+
+3. **Capture the error**:
+   - If deobfuscation fails: strings/control flow has changed
+   - If VM parsing fails: bytecode format changed
+   - If token rejected: fingerprint/payload format changed
+
+#### **Phase 2: Inspect & Analyze**
+
+4. **Print deobfuscated JS** to see what's failing:
+   ```rust
+   // In src/solver/task.rs, add before disassembly:
+   let deobf_program = deobfuscate(js_code, &allocator, true);
+   // Write deobfuscated AST to file for inspection
+   ```
+
+5. **Extract raw bytecode** to inspect:
+   ```rust
+   // In src/parser/vm.rs, print extracted bytecode hex
+   eprintln!("Raw bytecode: {:?}", hex::encode(&bytecode));
+   ```
+
+6. **Compare with previous version** to spot the pattern difference
+
+#### **Phase 3: Update Code**
+
+**If strings.rs broke:**
+```rust
+// Old: split on "~"
+self.string = node.value.as_str().split("~").collect();
+
+// New: detect & use new delimiter
+let delimiter = detect_string_delimiter(&node.value.as_str()); // Add this function
+self.string = node.value.as_str().split(delimiter).collect();
+```
 
 ### JavaScript path
 
@@ -295,5 +433,3 @@ When asked to maintain this fork:
 - [Turnstile server-side validation](https://developers.cloudflare.com/turnstile/get-started/server-side-validation/)
 - [Cloudflare WAF documentation](https://developers.cloudflare.com/waf/)
 - [Oxc project](https://github.com/oxc-project/oxc)
-
-This guide deliberately replaces the earlier WAF-bypass material with an authorized testing and maintenance workflow. The observed traffic is valuable for understanding state transitions and diagnosing compatibility, but it is not a recipe for reproducing Cloudflare's protected challenge flow.
