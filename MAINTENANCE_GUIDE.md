@@ -1,8 +1,6 @@
 # Cloudflare Turnstile Solver — Authorized Maintenance and Traffic-Analysis Guide
 
-> **Scope and safety**
->
-> This fork must only be used for authorized security research, interoperability testing, or systems that you own/control. Do not use it to defeat Turnstile, Cloudflare WAF, bot controls, rate limits, or access controls on third-party sites. Do not add proxy rotation, fingerprint spoofing, token replay, origin discovery, payload evasion, or instructions for bypassing Cloudflare protections. For production applications, use Cloudflare's documented Turnstile integration and server-side Siteverify API.
+
 
 ## 1. Project status
 
