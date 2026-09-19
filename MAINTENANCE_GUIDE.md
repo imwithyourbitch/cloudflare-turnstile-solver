@@ -1,973 +1,301 @@
-# Cloudflare Turnstile Solver - Comprehensive Maintenance Guide
+# Cloudflare Turnstile Solver — Authorized Maintenance and Traffic-Analysis Guide
 
-**Status**: Project is outdated and non-functional as of the last commit. This guide is for maintaining and updating it to work with current Cloudflare Turnstile implementations.
+> **Scope and safety**
+>
+> This fork must only be used for authorized security research, interoperability testing, or systems that you own/control. Do not use it to defeat Turnstile, Cloudflare WAF, bot controls, rate limits, or access controls on third-party sites. Do not add proxy rotation, fingerprint spoofing, token replay, origin discovery, payload evasion, or instructions for bypassing Cloudflare protections. For production applications, use Cloudflare's documented Turnstile integration and server-side Siteverify API.
 
-**Created for**: AI Agent autonomous maintenance and updates
+## 1. Project status
 
----
+This repository is a Rust, request-oriented research implementation. The upstream README explicitly says that it is outdated and no longer works. It contains no WAF implementation, and a Turnstile token is not equivalent to WAF approval: Cloudflare evaluates the complete request, session, client, and site configuration independently.
 
-## Table of Contents
-1. [Project Overview](#project-overview)
-2. [Architecture & Component Breakdown](#architecture--component-breakdown)
-3. [How to Update When Cloudflare Changes](#how-to-update-when-cloudflare-changes)
-4. [JavaScript Parsing & Deobfuscation Pipeline](#javascript-parsing--deobfuscation-pipeline)
-5. [VM Bytecode Disassembly & Parsing](#vm-bytecode-disassembly--parsing)
-6. [Libraries & Tools Required](#libraries--tools-required)
-7. [WAF Handling (Missing Component)](#waf-handling-missing-component)
-8. [Testing & Validation](#testing--validation)
-9. [Common Failure Points & Fixes](#common-failure-points--fixes)
+The maintenance objective should therefore be **reproducible analysis and compatibility testing in a controlled lab**, not a promise that arbitrary third-party challenges can be solved.
 
----
+## 2. Repository architecture
 
-## Project Overview
-
-**What it does**: This is a pure HTTP-based (browserless) Cloudflare Turnstile CAPTCHA solver that fully reverses Cloudflare's JavaScript challenge logic to generate valid tokens without a browser.
-
-**Problem it solves**: Allows programmatic solving of Turnstile challenges at scale without overhead of browser automation (Selenium/Playwright).
-
-**Current Status**: Out of date. Cloudflare frequently updates obfuscation, VM bytecode, and payload formats. This guide helps update it.
-
-**License**: GPLv3
-
-**Key Contributors**:
-- **mciem** (@mciem): JavaScript deobfuscation, JS parser, payload analysis
-- **mune** (@munew): VM reverse engineering, bytecode disassembly, core solver logic
-
----
-
-## Architecture & Component Breakdown
-
-### High-Level Flow
-
-```
-1. User provides: site_key + referrer URL
-                    ↓
-2. TurnstileSolver creates task with fingerprint
-                    ↓
-3. TaskClient fetches Cloudflare challenge JS
-                    ↓
-4. Deobfuscator parses & transforms JS
-                    ↓
-5. PayloadKeyExtractor identifies required payload keys
-                    ↓
-6. Parser extracts VM bytecode & magic bits
-                    ↓
-7. Disassembler converts bytecode → instructions
-                    ↓
-8. VMParser interprets instructions → token generation logic
-                    ↓
-9. Task solver generates fingerprint data
-                    ↓
-10. Encryption XOR-encodes response
-                    ↓
-11. Token submitted → Cloudflare validates
+```text
+src/
+  deobfuscator/       Oxc-based JavaScript AST transforms
+  parser/             Payload, VM, offsets, magic-bit, and function extraction
+  disassembler/       Bytecode/instruction decoding
+  decompiler/         Research/debugging decompiler components
+  reverse/            Compression and response/payload transformation code
+  solver/             Task orchestration, HTTP client, fingerprint model, VM parser
+  bin/solve_test/     Local executable used by the original author for testing
 ```
 
-### Core Modules
+The public crate surface is declared in `src/lib.rs`. `TurnstileSolver` in `src/solver/mod.rs` loads fingerprint fixtures from `workspace/cloudflare_test.json`, creates a `TurnstileTask`, and `task.rs` coordinates challenge retrieval, JavaScript analysis, payload construction, and response processing.
 
-#### 1. **`solver/`** - Main solver orchestration
-- **`mod.rs`**: Entry point `TurnstileSolver`, loads fingerprints, creates tasks
-- **`task.rs`** (27KB): Central orchestrator - coordinates deobfuscation, parsing, VM execution
-- **`task_client.rs`** (21KB): HTTP client for Cloudflare communication, fetches challenge JS
-- **`challenge.rs`**: Challenge options & metadata handling
-- **`vm_parser.rs`** (35KB): Parses VM bytecode, executes instructions, generates tokens
-- **`user_fingerprint.rs`**: Browser fingerprint simulation (TLS, headers, timings)
-- **`performance.rs`**: Fake performance timing data
-- **`timezone/`**: Timezone detection & spoofing
-- **`keys.rs`**: Manages payload key extraction & encryption keys
-- **`utils.rs`**: Helper functions
-- **`entries/`**: Fingerprint entry handlers (eval errors, etc.)
+### JavaScript path
 
-#### 2. **`deobfuscator/`** - JavaScript un-obfuscation
-- **`mod.rs`**: Main pipeline coordinator
-- **`transformers/`**: Individual obfuscation reversal modules
-  - **`strings.rs`**: Decode string arrays (split delimiters, numeric lookups)
-  - **`control_flow_flattening.rs`**: Unflatten for/switch patterns
-  - **`proxy_functions.rs`**: Remove function indirection layers
-  - **`sequence_expressions.rs`**: Break comma-separated expressions into statements
-  - **`normalize_conditionals.rs`**: Simplify if/else chains
-  - **`useless_if.rs`**: Remove dead code
-  - **`numbers.rs`**: Simplify numeric literals
+`src/deobfuscator/mod.rs` parses non-module JavaScript with Oxc and applies these visitors in order:
 
-#### 3. **`parser/`** - Payload & bytecode extraction
-- **`mod.rs`**: Module declaration
-- **`payload.rs`**: Identifies required payload keys from JS (browser keys, initial state)
-- **`magic_bits.rs`** (24KB): Extracts opcode/magic bits from bytecode
-- **`vm.rs`**: Locates VM bytecode in obfuscated code
-- **`functions.rs`**: Function signature extraction
-- **`offset.rs`**: Calculates offsets within bytecode
-- **`utils.rs`**: Parsing utilities
+1. `numbers.rs`
+2. `strings.rs`
+3. `sequence_expressions.rs`
+4. `proxy_functions.rs`
+5. `control_flow_flattening.rs`
+6. `normalize_conditionals.rs`
+7. `useless_if.rs`
 
-#### 4. **`disassembler/`** - Bytecode → instructions
-- **`mod.rs`** (30KB): Main disassembly logic, converts raw bytecode into `Instruction` objects
-- **`instructions.rs`** (10KB): Instruction enum definitions, opcode mappings
-- **`disassemble.rs`**: Entry point for disassembly
+`src/parser/payload.rs` then looks for version-sensitive literals and assignments, including `_cf_chl_opt;`-prefixed data and initialization patterns. Treat every such heuristic as a fixture-backed detector, not a stable protocol contract.
 
-#### 5. **`reverse/`** - Encryption & reversal
-- **`encryption.rs`**: XOR-based encryption/decryption
-  - `CloudflareXorEncryption`: Encrypts request payload
-  - `decrypt_cloudflare_response()`: Decrypts server response
-- **Other files**: Compression, compression detection
+## 3. What the supplied trace shows
 
-#### 6. **`decompiler/`** - (Unused, likely for debugging)
+The trace is not a simple “download JavaScript, submit token” flow. It shows a versioned, stateful challenge session with multiple challenge-platform phases:
 
----
+### 3.1 Bootstrap and version selection
 
-## How to Update When Cloudflare Changes
-
-Cloudflare updates Turnstile roughly **every 2-8 weeks**. Here's what changes and how to detect/fix it:
-
-### Common Changes & Detection
-
-| Change Type | How Cloudflare Changes It | How to Detect | Fix Strategy |
-|---|---|---|---|
-| **String Obfuscation** | Changes split delimiter ("~" → "|"), array format | Deobfuscator fails to decode strings, JS remains garbled | Update `strings.rs` transformer: change split pattern |
-| **Control Flow** | Changes for/switch flattening pattern | `control_flow_flattening.rs` fails to match pattern | Inspect raw bytecode, update regex/parsing logic |
-| **Proxy Functions** | Adds wrapper layers, changes indirection naming | Function calls still wrapped after deobfuscation | Extend `proxy_functions.rs` visitor patterns |
-| **VM Bytecode Format** | Changes opcode values, adds new instructions | Disassembler produces incorrect instructions | Update `instructions.rs` opcode mappings |
-| **Payload Keys** | Adds/removes required fingerprint keys | Token submission fails with "missing field" errors | Update `payload.rs` key extraction logic |
-| **Encryption** | Changes XOR key format or algorithm | Encrypted payload is invalid | Inspect network traffic, update `encryption.rs` |
-| **Fingerprint Requirements** | Adds new TLS fields, header checks, timing validation | Token rejected even with correct payload | Update `user_fingerprint.rs` |
-
-### Step-by-Step Update Process
-
-#### **Phase 1: Detect the Change**
-
-1. **Fetch current Turnstile JS** from a test page:
-   ```bash
-   curl -s "https://challenges.cloudflare.com/turnstile/v0/api.js" > turnstile.js
-   ```
-
-2. **Try running the existing solver**:
-   ```bash
-   cargo run --bin solve_test --release
-   ```
-
-3. **Capture the error**:
-   - If deobfuscation fails: strings/control flow has changed
-   - If VM parsing fails: bytecode format changed
-   - If token rejected: fingerprint/payload format changed
-
-#### **Phase 2: Inspect & Analyze**
-
-4. **Print deobfuscated JS** to see what's failing:
-   ```rust
-   // In src/solver/task.rs, add before disassembly:
-   let deobf_program = deobfuscate(js_code, &allocator, true);
-   // Write deobfuscated AST to file for inspection
-   ```
-
-5. **Extract raw bytecode** to inspect:
-   ```rust
-   // In src/parser/vm.rs, print extracted bytecode hex
-   eprintln!("Raw bytecode: {:?}", hex::encode(&bytecode));
-   ```
-
-6. **Compare with previous version** to spot the pattern difference
-
-#### **Phase 3: Update Code**
-
-**If strings.rs broke:**
-```rust
-// Old: split on "~"
-self.string = node.value.as_str().split("~").collect();
-
-// New: detect & use new delimiter
-let delimiter = detect_string_delimiter(&node.value.as_str()); // Add this function
-self.string = node.value.as_str().split(delimiter).collect();
+```text
+/turnstile/v0/api.js                         302
+/turnstile/v0/g/330e41bb475c/api.js          200
 ```
 
-**If control_flow_flattening.rs broke:**
-```rust
-// Old: looks for | delimiter in flow string
-let flow_str = string.split("|").collect::<Vec<&str>>();
+The public `v0/api.js` URL redirects to a build-specific URL containing a short version/build identifier (`330e41bb475c`). The redirected resource is approximately 86 KB in this capture. A client should follow redirects and record the final URL, response headers, cache metadata, and body hash; it should not hard-code the build identifier.
 
-// New: handle alternative patterns
-let flow_str = if string.contains("|") {
-    string.split("|").collect()
-} else if string.contains(",") {
-    string.split(",").collect()
-} else {
-    // Log pattern for manual inspection
-    eprintln!("New control flow pattern: {}", string);
-    return None;
-};
+### 3.2 Challenge initialization
+
+```text
+/cdn-cgi/challenge-platform/h/g/turnstile/f/av0/rch/r1ooi/<site-key>/auto/fbE/new/normal?lang=auto
 ```
 
-**If vm_parser.rs bytecode parsing broke:**
-```rust
-// In src/disassembler/instructions.rs, update opcode enum:
-pub enum InstructionType {
-    // Old opcodes...
-    Push = 0x01,
-    // NEW OPCODES (add as discovered)
-    NewOpcodeX = 0xFF,
+This is a challenge-platform Turnstile resource. Useful structural fields are:
+
+- `h/g`: challenge-platform routing namespace
+- `turnstile/f/av0`: Turnstile flow family/version marker
+- `rch/r1ooi`: opaque flow/session routing values
+- `<site-key>`: the public widget site key
+- `auto/fbE`: mode/feature values that should be treated as opaque
+- `new/normal`: initial flow state and presentation mode
+- `lang=auto`: language negotiation
+
+The opaque segments are session- and deployment-dependent. They are not durable API parameters and must not be copied between sessions.
+
+### 3.3 `fo` POST exchanges
+
+The trace contains POSTs to:
+
+```text
+/cdn-cgi/challenge-platform/h/g/fo/<challenge-id>/<opaque-session-token>
+```
+
+The first POST has a small body and returns a very large response (about 823 KB). Later POSTs have bodies around 87–91 KB and responses around 127 KB or a few KB. This strongly indicates a staged challenge exchange: bootstrap/orchestration first, then one or more client-state or attestation messages.
+
+The `<challenge-id>` itself is structured in the capture with colon-separated numeric/time-like fields and an opaque component. The remainder is an opaque session token. Do not infer that the fields are independently forgeable; record them only for diagnostics and compare them across requests from the same authorized session.
+
+### 3.4 `pat` and `ci` resources
+
+The trace also contains:
+
+```text
+/cdn-cgi/challenge-platform/h/g/pat/<opaque-id>/<timestamp>/<opaque-attestation>
+/cdn-cgi/challenge-platform/h/g/ci/<opaque-id>/<timestamp>/<opaque-attestation>
+```
+
+`pat` and `ci` appear to be separate challenge-platform phases. Their URLs contain timestamp-like path components and very long opaque, URL-safe values. The `pat` request returns `401` in the capture, while the related `ci` request returns `200`. That is an important diagnostic distinction: a 401 on one phase is not proof that the whole Turnstile flow failed, and a 200 on another phase is not proof that a token is accepted.
+
+The `failure_retry` URL in the second Turnstile GET indicates a retry state:
+
+```text
+/turnstile/f/av0/<opaque-build-or-session>/r1ooi/<site-key>/auto/fbE/failure_retry/normal?lang=auto
+```
+
+A retry URL is a new state in the challenge flow, not a reusable replacement for the original request. Maintain state transitions in logs rather than treating URL strings as static endpoints.
+
+### 3.5 Important conclusions from the trace
+
+- The redirect target is build-specific and changes over time.
+- Challenge URLs contain short routing labels plus long, expiring opaque values.
+- The flow is multi-stage and stateful; POST bodies and response bodies matter.
+- Timestamps and version markers are diagnostic metadata, not safe values to synthesize.
+- The 401 `pat` response should be investigated with request/response headers, cookies, and server-side test configuration—not bypassed.
+- Body sizes alone do not reveal payload schemas or establish that a request is valid.
+
+## 4. Safe capture and comparison workflow
+
+Use only a test site and account that you control. Capture metadata and redacted artifacts:
+
+```text
+request index, method, final URL, status
+request/response headers after removing cookies and authorization values
+body length, content type, compression, and SHA-256 body hash
+redirect chain
+same-session cookie names, not cookie values
+monotonic timing between requests
+```
+
+Never commit raw challenge URLs, cookies, site secrets, tokens, full POST bodies, or unredacted challenge JavaScript to a public repository. Long URL path segments in the supplied trace should be treated as secrets/session identifiers and redacted in fixtures.
+
+Create a fixture manifest such as:
+
+```json
+{
+  "fixture": "authorized-lab-2026-09-19",
+  "api_final_path": "/turnstile/v0/g/<build>/api.js",
+  "status_sequence": [302, 200, 200, 200],
+  "body_sha256": "<redacted-or-local-only>",
+  "notes": "Opaque session values removed"
 }
 ```
 
-#### **Phase 4: Test & Validate**
+Compare normalized structure, not exact opaque values. Useful comparisons include:
 
-7. **Run tests**:
-   ```bash
-   cargo test --lib
-   cargo run --bin solve_test --release
-   ```
+- redirect destination shape;
+- presence and order of challenge phases;
+- status transitions;
+- content types and compression;
+- extracted AST node counts;
+- number of decoded strings;
+- unknown opcode count;
+- payload key set, without storing sensitive values.
 
-8. **Validate token** on test site (mune.sh, or create test harness)
+## 5. Maintenance plan for the JavaScript pipeline
 
----
+### Step 1 — Pin the input
 
-## JavaScript Parsing & Deobfuscation Pipeline
+Save the authorized lab response locally, hash it, and record its final URL and timestamp. Do not fetch live challenge code repeatedly during development.
 
-### Libraries Used
+### Step 2 — Parse defensively
+
+The current code uses:
 
 ```toml
-# Core JS parsing (Rust-based, Oxc = O(xc)ompler)
-oxc_allocator = "0.62.0"       # Memory management for AST
-oxc_ast = "0.62.0"             # AST node definitions
-oxc_ast_visit = "0.62.0"       # Visitor pattern (traversal/mutation)
-oxc_parser = "0.62.0"          # JS parser → AST
-oxc_semantic = "0.62.0"        # Semantic analysis
-oxc_span = "0.62.0"            # Source location tracking
-```
-
-### Pipeline Steps
-
-#### Step 1: **Parse** (oxc_parser)
-```rust
-let source_type = SourceType::default().with_module(false);
-let parsed = Parser::new(allocator, js_code, source_type).parse();
-let program = allocator.alloc(parsed.program);
-```
-- Converts raw JS string → AST
-- Result: `Program` with statements, expressions, functions
-
-#### Step 2: **Deobfuscate** (custom transformers)
-
-Each transformer implements `VisitMut<'a>` trait to walk & mutate AST in-place.
-
-**Order matters** (as in `deobfuscator/mod.rs`):
-1. **NumbersVisitor** → Simplify numeric literals
-2. **StringVisitor** → Decode string arrays  
-3. **SequenceExpressions** → Break comma expressions
-4. **ReplaceProxyFunctions** → Remove wrapper layers
-5. **ControlFlowFlattening** → Reconstruct control flow
-6. **NormalizeConditionals** → Simplify conditionals
-7. **UselessIf** → Remove dead code
-
-#### Step 3: **Extract Payload Keys** (payload.rs)
-```rust
-pub fn extract_keys(program: &Program) -> PayloadKeyExtractor {
-    let mut extractor = PayloadKeyExtractor::default();
-    extractor.visit_program(program);
-    extractor
-}
-```
-- Walks deobfuscated AST
-- Identifies `setTimeout(..., 100, ..., { key: value, ... })` patterns
-- Captures required fingerprint keys
-
-#### Step 4: **(Optional) Codegen** (not currently used)
-```rust
-// To regenerate readable JS from AST:
-use oxc_codegen::Codegen;
-let code = Codegen::new().build(&program);
-```
-
-### Transformer Details
-
-#### **strings.rs** - String Decoding
-Cloudflare stores strings in obfuscated arrays:
-```javascript
-// Original:
-var strings = ["hello", "world", "foo~bar"];
-var msg = strings[0];
-
-// After obfuscation:
-var a = [...];
-var b = function(c) { return a[c]; };
-var msg = b(0);
-```
-
-**How it works**:
-1. Find large string literals containing delimiter (~, |, etc.)
-2. Extract & split by delimiter → array
-3. Walk AST for numeric lookups: `strings[12]` → replace with `"decoded_string"`
-
-**Update when**: Cloudflare changes delimiter or uses new encoding scheme
-
-#### **control_flow_flattening.rs** - Reconstructing Logic Flow
-Cloudflare flattens control flow into for/switch:
-```javascript
-// Original logic:
-if (condition) {
-    doA();
-    doB();
-} else {
-    doC();
-}
-
-// After flattening:
-var state = "a|b|c";  // Flow string
-for (var i = 0; i < 1; i++) {
-    switch (state[i]) {
-        case "a": doA(); break;
-        case "b": doB(); break;
-        case "c": doC(); break;
-    }
-}
-```
-
-**How it works**:
-1. Detect `for (init; test; update) { switch(...) }` pattern
-2. Extract flow string: "a|b|c"
-3. Find case statements matching flow
-4. Reconstruct in execution order
-
-**Update when**: Flow string delimiter changes, or multi-loop patterns appear
-
-#### **proxy_functions.rs** - Removing Function Indirection
-```javascript
-// Original:
-var obj = {
-    "call": function(f, a, b) { return f(a, b); },
-    "op": function(a, b) { return a + b; }
-};
-obj.call(obj.op, 2, 3);  // Should be obj.op(2, 3)
-
-// After deobfuscation:
-obj.op(2, 3);
-```
-
-**How it works**:
-1. Find object assignments: `obj = { key: func, ... }`
-2. Analyze each property: does it wrap another call?
-3. Mark as proxy if returns another function or binary operation
-4. Replace all `obj.key(...)` calls with inlined function
-
-**Update when**: Cloudflare changes wrapper naming, or uses deeper nesting
-
----
-
-## VM Bytecode Disassembly & Parsing
-
-### What is the VM?
-
-Cloudflare embeds a **custom JavaScript VM** in the challenge code. Instead of plain JavaScript logic, it's bytecode that must be:
-1. **Extracted** from obfuscated JS
-2. **Disassembled** into instructions (like CPU assembly)
-3. **Interpreted** to generate the token
-
-### Bytecode Format
-
-**Raw bytecode structure** (example):
-```
-01 02 03 04 [payload]... FF
-```
-
-Where:
-- `01` = opcode 0x01 (e.g., PUSH)
-- `02 03 04` = operands (vary by opcode)
-- `[payload]` = data section
-- `FF` = end marker
-
-### Disassembly Process
-
-#### 1. **Extract Bytecode** (`parser/vm.rs`)
-```rust
-pub fn extract_vm_bytecode(program: &Program) -> Option<Vec<u8>> {
-    // Find string containing bytecode markers
-    // Decode from base64 or hex
-    // Return raw bytes
-}
-```
-
-#### 2. **Parse Magic Bits** (`parser/magic_bits.rs`, 24KB)
-Identifies opcode boundaries and operand sizes:
-```rust
-pub fn parse_magic_bits(bytecode: &[u8]) -> MagicBitsResult {
-    // Detects bit-packed opcodes
-    // Returns instruction boundaries
-}
-```
-
-#### 3. **Disassemble** (`disassembler/mod.rs`)
-```rust
-pub fn disassemble(bytecode: &[u8]) -> Result<Vec<Instruction>> {
-    let mut instructions = Vec::new();
-    let mut offset = 0;
-    
-    while offset < bytecode.len() {
-        let opcode = bytecode[offset];
-        let instr = Instruction::decode(opcode, &bytecode[offset..])?;
-        instructions.push(instr);
-        offset += instr.size();
-    }
-    
-    Ok(instructions)
-}
-```
-
-#### 4. **Execute VM** (`solver/vm_parser.rs`, 35KB)
-```rust
-pub struct VMExecutor {
-    stack: Vec<Value>,
-    registers: [Value; 32],
-    memory: HashMap<u64, Value>,
-}
-
-impl VMExecutor {
-    pub fn execute(&mut self, instructions: &[Instruction]) -> Value {
-        for instr in instructions {
-            match instr {
-                Instruction::Push(val) => self.stack.push(val),
-                Instruction::Pop => { self.stack.pop(); }
-                Instruction::Add => { /* pop 2, push sum */ }
-                // ... more opcodes
-            }
-        }
-        self.stack.pop().unwrap()
-    }
-}
-```
-
-### Opcode Reference (Subject to Change)
-
-**Common opcodes** (from `disassembler/instructions.rs`):
-```rust
-pub enum InstructionType {
-    Nop = 0x00,
-    Push = 0x01,
-    Pop = 0x02,
-    Load = 0x03,
-    Store = 0x04,
-    Add = 0x05,
-    Sub = 0x06,
-    Xor = 0x07,
-    Call = 0x08,
-    Return = 0x09,
-    JumpIfZero = 0x0A,
-    Jump = 0x0B,
-    // ... more
-}
-```
-
-**When Cloudflare changes**:
-- New opcodes added → update `InstructionType` enum
-- Operand sizes change → update `decode()` function
-- Register count changes → update VM registers array
-
-### Key Data Structures
-
-```rust
-// From disassembler/instructions.rs
-#[derive(Debug, Clone)]
-pub enum Instruction {
-    Push(Value),
-    Pop,
-    Load { register: u8, offset: u32 },
-    Store { register: u8, offset: u32 },
-    Add { dest: u8, src1: u8, src2: u8 },
-    // ... etc
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum Value {
-    Integer(i64),
-    Float(f64),
-    String(String),
-    Bytes(Vec<u8>),
-}
-```
-
----
-
-## Libraries & Tools Required
-
-### Rust Crate Dependencies (Cargo.toml)
-
-```toml
-[dependencies]
-# JavaScript parsing & AST
 oxc_allocator = "0.62.0"
 oxc_ast = "0.62.0"
 oxc_ast_visit = "0.62.0"
 oxc_parser = "0.62.0"
 oxc_semantic = "0.62.0"
 oxc_span = "0.62.0"
-
-# Data structures
-petgraph = "0.8.1"               # Graph algorithms for control flow
-rustc-hash = "2.0.0"             # Fast HashMap (FxHashMap)
-
-# Serialization
-serde_json = "1.0.140"           # JSON parsing
-serde = { version = "1.0.219", features = ["derive"] }
-
-# HTTP & networking
-rquest = { version = "5.1.0", features = [
-    "cookies",
-    "brotli",
-    "gzip",
-    "stream",
-    "json",
-] }
-rquest-util = "2.2.0"
-
-# Async runtime
-tokio = { version = "1.44.2", features = [
-    "macros",
-    "rt",
-    "rt-multi-thread",
-] }
-async-trait = "0.1.88"
-
-# Utilities
-anyhow = "1.0.98"                # Error handling
-once_cell = "1.21.3"             # Lazy statics
-chrono = "0.4.41"                # Time/timezone
-chrono-tz = "0.10.3"             # Timezone database
-url = "2.5.4"                    # URL parsing
-num = "0.4.3"                    # Numeric utilities
-uuid = { version = "1.16.0", features = ["v4"] }
-regex = "1.11.1"                 # Pattern matching
-
-# Encoding & compression
-base64 = "0.22.1"                # Base64 encode/decode
-hex = "0.4.3"                    # Hex encode/decode
-flate2 = "1.1.1"                 # Gzip
-brotli = "8.0.0"                 # Brotli
-zstd = "0.13.3"                  # Zstandard
-
-# GeoIP (for fingerprinting)
-maxminddb = "0.26.0"             # GeoIP lookups
-
-# Misc
-byteorder = "1.5.0"              # Byte manipulation
-png = "0.18.0-rc"                # PNG image handling
-strum = { version = "0.27.1", features = ["derive"] }
-rand = "0.9.1"                   # Random number generation
-sha2 = "0.11.0-pre.5"            # SHA-2 hashing
 ```
 
-### Recommended Additions for Maintenance
+Update Oxc as a coordinated version set, then run the fixture suite. Treat parser diagnostics as test failures; do not silently continue with a partial AST.
 
-```toml
-# For code generation (regenerate JS from AST)
-oxc_codegen = "0.62.0"
+### Step 3 — Run visitors independently
 
-# For testing deobfuscator quality
-criterion = "0.5"                # Benchmarking
+Add a diagnostic mode that runs each visitor against a copy of the fixture and records:
 
-# For better pattern detection
-lazy_static = "1.4"              # Global patterns
+- parser errors and warnings;
+- AST node counts before and after;
+- number of replacements per visitor;
+- unchanged suspicious constructs;
+- execution time and allocation size.
+
+Do not make a transformer more permissive merely to make a live request pass. First add a minimized fixture that demonstrates the new syntax and a test showing the intended, semantics-preserving rewrite.
+
+### Step 4 — Update string extraction carefully
+
+`strings.rs` currently recognizes specific large literals and split/lookup shapes. When a fixture changes:
+
+1. confirm the literal is actually a string table;
+2. detect delimiters from structure, not a blind list of characters;
+3. reject ambiguous candidates;
+4. test empty elements, escaped separators, Unicode, and numeric bounds;
+5. preserve the original AST when confidence is low.
+
+### Step 5 — Update proxy and control-flow transforms
+
+`proxy_functions.rs` and `control_flow_flattening.rs` contain shape-specific assumptions. Add explicit pattern detectors and counters. Never use unchecked indexing, `unwrap()`, or unsafe AST reinterpretation for a newly observed shape until it has a regression fixture. In particular, `proxy_functions.rs` currently contains unsafe `transmute_copy` paths that should be audited before extending them.
+
+### Step 6 — Treat parser/disassembler changes as schema changes
+
+Unknown bytecodes should produce a structured diagnostic containing the offset, surrounding bytes, active decode mode, and fixture hash. Do not guess opcode meanings from one sample. Add an instruction only after correlating multiple authorized fixtures and documenting operand width, stack/register effects, and control-flow behavior.
+
+## 6. Libraries and tools
+
+Core dependencies are listed in `Cargo.toml`:
+
+- **Oxc**: JavaScript parsing, AST representation, visitors, spans, and semantic support.
+- **`rquest` / `rquest-util`**: HTTP transport and cookies/compression for lab traffic.
+- **Tokio**: asynchronous runtime.
+- **Serde/Serde JSON**: typed configuration and payload data.
+- **`petgraph` / `rustc-hash`**: graph and fast-map support.
+- **`base64`, `hex`, `flate2`, `brotli`, `zstd`, `byteorder`**: format and compression handling.
+- **`anyhow`, `regex`, `url`, `chrono`, `chrono-tz`, `uuid`, `rand`**: errors, parsing, timing, identifiers, and test data.
+
+Useful maintenance additions are `oxc_codegen` for local AST inspection and `criterion` for regression benchmarks. Keep these tools offline and fixture-driven.
+
+## 7. WAF and authorization boundary
+
+The upstream README says WAF is not included. That is accurate: WAF policy enforcement occurs at Cloudflare's edge and is not a missing Rust module that can safely be “added” to this project. Do not integrate WAF-bypass repositories, origin-IP discovery tools, payload-evasion lists, proxy rotation, or anti-bot circumvention code.
+
+For an owned application, the correct engineering path is:
+
+1. configure Turnstile through Cloudflare's dashboard;
+2. render the widget using the documented integration;
+3. send the returned token to your own backend;
+4. call Cloudflare's documented Siteverify endpoint server-side;
+5. enforce your own authorization, rate limits, CSRF protection, and audit logging;
+6. use Cloudflare WAF rules in **log/simulate mode** while diagnosing false positives;
+7. inspect Cloudflare security events and adjust an owned rule or allowlist rather than attempting to evade it.
+
+A Turnstile token must never be accepted without server-side verification, hostname/action checks where applicable, expiry handling, and replay protection.
+
+## 8. Tests the AI agent should add
+
+### Unit tests
+
+- parser diagnostics are surfaced;
+- each transformer has before/after fixtures;
+- transformations are idempotent where intended;
+- string indexes are bounds-checked;
+- unknown instruction bytes fail closed with context;
+- URL parsing extracts only structural segments and never logs opaque values;
+- response decompression and decoding reject malformed input.
+
+### Integration tests
+
+Run only against a controlled test site. Verify documented application behavior, not bypass success:
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets
+cargo run --release --bin solve_test
 ```
 
-### Tool Usage Summary
+The integration test must use environment-provided test configuration rather than hard-coded keys or URLs:
 
-| Library | Purpose | Used In | Update When |
-|---|---|---|---|
-| **oxc_*** | JS parsing & AST | `deobfuscator/`, `parser/` | Cloudflare changes JS syntax (rare) |
-| **rustc-hash** | Fast lookups | `disassembler/`, `deobfuscator/` | Never (core perf) |
-| **serde_json** | JSON payload | `solver/`, `reverse/` | Payload format changes |
-| **rquest** | HTTP client | `solver/task_client.rs` | Cloudflare changes headers/TLS |
-| **tokio** | Async runtime | All async code | Never (unless moving frameworks) |
-| **sha2, hex, base64** | Encoding | `reverse/encryption.rs` | Cloudflare changes crypto algorithm |
-| **chrono** | Timing/timezone | `solver/performance.rs` | Cloudflare adds timing checks |
-| **maxminddb** | Fingerprint data | `solver/user_fingerprint.rs` | Yearly (GeoIP database updates) |
-
----
-
-## WAF Handling (Missing Component)
-
-**Current Status**: NOT INCLUDED in this repository (as stated in README).
-
-### What is the Cloudflare WAF?
-
-The **Web Application Firewall (WAF)** is a separate Cloudflare security layer that:
-- Inspects HTTP request bodies/headers
-- Detects attack patterns (SQLi, XSS, bot behavior)
-- **Can reject valid-looking Turnstile tokens** if request context looks suspicious
-
-### Why It's Missing Here
-
-This solver generates **valid Turnstile tokens**, but the WAF can still reject your HTTP request if:
-- User-Agent is unrealistic
-- Request timing is inhuman
-- IP reputation is bad
-- TLS fingerprint doesn't match token context
-- Payload size triggers size-based blocks
-
-### How to Handle WAF
-
-#### Option 1: Use Existing WAF Bypass Projects
-
-**Recommended projects**:
-1. **[abund4nt/bypass-waf](https://github.com/abund4nt/bypass-waf)**
-   - Real-world WAF evasion techniques
-   - Cloudflare-specific payload size limits (Free: 8KB, Enterprise: 128KB)
-   - PoC code for testing
-
-2. **[0xInfection/Awesome-WAF](https://github.com/0xInfection/Awesome-WAF)**
-   - Curated resource list
-   - Detection & fingerprinting tools
-
-3. **[spyboy-productions/CloakQuest3r](https://github.com/spyboy-productions/CloakQuest3r)**
-   - Identifies real server IP (useful for direct requests to bypass Cloudflare)
-
-4. **[cloudscraper25 (PyPI)](https://pypi.org/project/cloudscraper25/)**
-   - Automated Cloudflare challenge handling
-   - Uses headless browser but shows request pattern examples
-
-#### Option 2: Build Custom WAF Evasion
-
-To integrate into this solver:
-
-**A. Use realistic headers**:
-```rust
-// In src/solver/task_client.rs, TaskClient struct:
-impl TaskClient {
-    fn build_headers() -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        
-        // Realistic headers from actual browsers
-        headers.insert("User-Agent", HeaderValue::from_static(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        ));
-        headers.insert("Accept-Language", HeaderValue::from_static("en-US,en;q=0.9"));
-        headers.insert("Accept-Encoding", HeaderValue::from_static("gzip, deflate, br"));
-        headers.insert("DNT", HeaderValue::from_static("1"));
-        headers.insert("Connection", HeaderValue::from_static("keep-alive"));
-        headers.insert("Upgrade-Insecure-Requests", HeaderValue::from_static("1"));
-        
-        // ... more headers
-        headers
-    }
-}
+```text
+TURNSTILE_TEST_SITE_KEY
+TURNSTILE_TEST_ORIGIN
+TURNSTILE_TEST_EXPECTED_HOSTNAME
 ```
 
-**B. Add request timing randomization**:
-```rust
-// In src/solver/utils.rs:
-pub fn random_delay_ms(min: u64, max: u64) -> u64 {
-    rand::rng().random_range(min..=max)
-}
+Do not run live challenge tests in pull requests by default. Keep them behind an explicit, opt-in workflow with secrets supplied by the repository owner.
 
-// In solver code:
-tokio::time::sleep(Duration::from_millis(random_delay_ms(100, 500))).await;
-```
+## 9. Failure triage
 
-**C. Rotate TLS profiles**:
-```rust
-// Use rquest with different TLS fingerprints
-// (Currently using single client; consider pool with rotation)
-```
+Classify failures before changing code:
 
-**D. Payload obfuscation** (optional):
-- Split large payloads
-- Add junk data
-- Use different encodings
+1. **Transport** — redirect, DNS, TLS, compression, timeout, or cookie handling.
+2. **Challenge state** — unexpected phase/order, retry state, or expired opaque value.
+3. **JavaScript parse/deobfuscation** — parser errors or visitor confidence failure.
+4. **Payload extraction** — changed keys or AST shape.
+5. **Disassembly/VM analysis** — unknown bytes, operand mismatch, or invalid control flow.
+6. **Application verification** — server-side Siteverify response, hostname/action mismatch, expiry, or replay.
+7. **Cloudflare/WAF policy** — inspect owned-zone security events; do not attempt bypass.
 
-#### Option 3: Proxy Integration
+Every error should include fixture hash, phase name, HTTP status, and a redacted correlation ID. It should not include cookies, raw tokens, full opaque URLs, or private payloads.
 
-Use proxy services to obscure traffic:
-```rust
-// In rquest ClientBuilder:
-let client = ClientBuilder::new()
-    .proxy(Proxy::https("http://proxy.example.com:8080")?)
-    .build()?;
-```
+## 10. AI-agent operating instructions
 
-### WAF Detection & Monitoring
+When asked to maintain this fork:
 
-Add logging to detect WAF blocks:
-```rust
-// In src/solver/task.rs, after token submission:
-if response.status() == 403 {
-    eprintln!("WAF BLOCK: Likely blocked by Cloudflare WAF");
-    eprintln!("Headers: {:?}", response.headers());
-} else if response.status() == 429 {
-    eprintln!("RATE LIMIT: Too many requests");
-}
-```
+1. Read this file and the current `Cargo.toml` before editing.
+2. Confirm the work is authorized and fixture-driven.
+3. Reproduce the failure using a pinned local fixture.
+4. Identify the failing phase from the triage categories above.
+5. Make the smallest semantics-preserving change.
+6. Add or update a redacted regression fixture and test.
+7. Run formatting, clippy, unit tests, and offline integration tests.
+8. Review the diff for secrets and unsafe logging.
+9. Do not add bypass, evasion, origin-discovery, token-replay, proxy-rotation, or third-party CAPTCHA-service functionality.
+10. Document observed URL-shape changes as metadata only; never document instructions for forging or replaying opaque challenge values.
 
----
+## 11. Useful official references
 
-## Testing & Validation
+- [Cloudflare Turnstile documentation](https://developers.cloudflare.com/turnstile/)
+- [Turnstile server-side validation](https://developers.cloudflare.com/turnstile/get-started/server-side-validation/)
+- [Cloudflare WAF documentation](https://developers.cloudflare.com/waf/)
+- [Oxc project](https://github.com/oxc-project/oxc)
 
-### Test Sites
-
-**Maintained by Cloudflare**:
-- `https://mune.sh/` (used in current code)
-- `https://cloudflare-captcha-test.com/` (if available)
-
-**Generic sites with Turnstile**:
-- Any site protected by Turnstile (search for `challenges.cloudflare.com`)
-
-### Test Harness
-
-Create `tests/integration_test.rs`:
-```rust
-#[tokio::test]
-async fn test_turnstile_solver() {
-    let solver = TurnstileSolver::new().await;
-    let mut task = solver
-        .create_task(
-            "0x4AAAAAABdbdHypG5Crbw0P",  // Site key
-            "https://mune.sh/",            // Referrer
-            None,
-            None,
-        )
-        .await
-        .expect("Failed to create task");
-
-    let result = task.solve().await.expect("Failed to solve");
-    
-    // Validate token format
-    assert!(!result.token.is_empty());
-    assert!(result.token.len() > 50);  // Typical token length
-    
-    // Optionally: submit to Cloudflare to verify
-    // (requires direct access to challenge endpoint)
-}
-```
-
-### Validation Checklist
-
-When updating, verify:
-
-- [ ] **Deobfuscation produces readable JS** (no obfuscation artifacts)
-- [ ] **String arrays decode correctly** (print extracted strings)
-- [ ] **Control flow unflattens properly** (statements in logical order)
-- [ ] **Bytecode disassembles without errors** (all opcodes recognized)
-- [ ] **VM executes successfully** (generates some output)
-- [ ] **Token format matches expected** (length, encoding, pattern)
-- [ ] **Token validates on test site** (accepts the generated token)
-- [ ] **Fingerprint passes inspection** (headers, timing, crypto are consistent)
-
----
-
-## Common Failure Points & Fixes
-
-### Failure 1: "Deobfuscator fails - strings not decoding"
-
-**Symptoms**: Deobfuscated JS still contains `var a=[...]` and numeric lookups.
-
-**Diagnosis**:
-```rust
-// Print extracted string array:
-eprintln!("Strings: {:?}", string_visitor.string);
-```
-
-**Fix**:
-1. Cloudflare changed string delimiter (was "~", now "|" or something else)
-2. Update `src/deobfuscator/transformers/strings.rs`:
-```rust
-// Line 31:
-self.string = node.value.as_str().split("~").collect();
-// Change to:
-self.string = node.value.as_str().split(new_delimiter).collect();
-```
-
-### Failure 2: "Control flow not unflattening"
-
-**Symptoms**: Bytecode extraction fails, or flow remains nested in for/switch.
-
-**Diagnosis**:
-```rust
-// In control_flow_flattening.rs, check matched pattern:
-if flow_str[0].len() > 2 {
-    return None;  // <-- This is why it failed
-}
-```
-
-**Fix**:
-1. Flow string format changed (multi-character states, new separators)
-2. Add debugging:
-```rust
-eprintln!("Flow string pattern: {} (len: {})", flow_str[0], flow_str[0].len());
-```
-3. Update pattern matching logic accordingly
-
-### Failure 3: "VM opcode not recognized"
-
-**Symptoms**: Disassembler panics or returns unknown opcode error.
-
-**Diagnosis**:
-```rust
-// In disassembler/instructions.rs:
-match opcode {
-    0x01..=0x20 => { /* known opcodes */ }
-    _ => {
-        eprintln!("Unknown opcode: 0x{:02X}", opcode);
-        return Err(...);
-    }
-}
-```
-
-**Fix**:
-1. Cloudflare added new opcode
-2. Inspect bytecode to determine opcode format:
-```rust
-eprintln!("Unknown bytecode segment: {:?}", &bytecode[offset..offset+10]);
-```
-3. Add new variant to `InstructionType` enum
-4. Implement decoder in `Instruction::decode()`
-
-### Failure 4: "Token submission fails - 401/403"
-
-**Symptoms**: Deobfuscation & parsing work, but Cloudflare rejects token.
-
-**Possible causes**:
-- Fingerprint mismatch (headers, TLS, timing)
-- Payload missing required fields
-- Token format wrong
-- WAF rejection
-
-**Diagnosis**:
-```rust
-// In task.rs, inspect generated payload:
-eprintln!("Generated payload: {:?}", serde_json::to_string_pretty(&payload)?);
-
-// Check fingerprint consistency:
-eprintln!("Fingerprint: {:?}", fingerprint);
-```
-
-**Fix**:
-- Verify all required keys extracted in `parser/payload.rs`
-- Check fingerprint fields match browser profile
-- Add missing keys to `user_fingerprint.rs`
-- If WAF: implement evasion techniques (see WAF section)
-
-### Failure 5: "Timeout - solver takes too long"
-
-**Symptoms**: Solver runs for minutes, expected to complete in seconds.
-
-**Possible causes**:
-- Infinite loop in VM execution
-- Inefficient string decoding
-- Network timeouts
-
-**Fix**:
-1. Add timeouts:
-```rust
-let solve_task = task.solve();
-let timeout = tokio::time::timeout(Duration::from_secs(30), solve_task);
-match timeout.await {
-    Ok(Ok(result)) => Ok(result),
-    Ok(Err(e)) => Err(e),
-    Err(_) => Err(anyhow!("Solver timeout exceeded")),
-}
-```
-
-2. Profile bottleneck:
-```rust
-let t = Instant::now();
-let result = deobfuscate(...);
-eprintln!("Deobfuscate took: {:?}", t.elapsed());
-```
-
----
-
-## Maintenance Checklist for AI Agent
-
-Use this checklist when Cloudflare updates:
-
-### Weekly Monitor
-- [ ] Check Cloudflare blog for Turnstile updates
-- [ ] Test solver on known-good test site
-- [ ] Monitor GitHub issues for reported breaks
-
-### When Solver Breaks
-- [ ] Run diagnostic: `cargo run --bin solve_test --release 2>&1 | tee error.log`
-- [ ] Identify failure point (deobfuscation/parsing/VM/WAF)
-- [ ] Extract current Turnstile JS for analysis
-- [ ] Compare with last known-good version
-- [ ] Identify changed pattern
-- [ ] Update relevant Rust code
-- [ ] Test locally
-- [ ] Create git commit with detailed message
-- [ ] Run full test suite: `cargo test --lib`
-- [ ] Document change in `CHANGELOG.md`
-
-### Code Update Template
-
-When modifying transformers:
-```rust
-// In relevant transformer file (e.g., strings.rs):
-
-// CHANGELOG: 2025-XX-XX - Updated for Cloudflare change
-// OLD: Split on "~" delimiter
-// NEW: Dynamic delimiter detection
-// DETECTION: String array was not decoding
-
-// Add helper function:
-fn detect_string_delimiter(s: &str) -> &str {
-    if s.contains("~") { "~" }
-    else if s.contains("|") { "|" }
-    else if s.contains(",") { "," }
-    else { panic!("Unknown delimiter in: {}", s) }
-}
-
-// Update visitor:
-self.string = node.value.as_str()
-    .split(detect_string_delimiter(node.value.as_str()))
-    .collect();
-```
-
-### Deployment
-- [ ] Merge to main branch
-- [ ] Tag with version (e.g., `v0.2.0`)
-- [ ] Update `Cargo.toml` version
-- [ ] Create GitHub release with changelog
-- [ ] Notify users of update
-
----
-
-## Additional Resources
-
-### Cloudflare Documentation
-- [Turnstile Overview](https://developers.cloudflare.com/turnstile/)
-- [Turnstile API Reference](https://developers.cloudflare.com/turnstile/api-reference/)
-
-### Reverse Engineering References
-- [Oxc Parser Docs](https://github.com/oxc-project/oxc)
-- [Mozilla AST Spec](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide)
-
-### Related Projects
-- [abund4nt/bypass-waf](https://github.com/abund4nt/bypass-waf) - WAF bypass techniques
-- [0xInfection/Awesome-WAF](https://github.com/0xInfection/Awesome-WAF) - WAF resources
-- [cloudscraper25](https://pypi.org/project/cloudscraper25/) - Cloudflare bypass reference
-
-### Testing Tools
-- [Burp Suite](https://portswigger.net/burp) - Proxy interceptor (inspect requests/responses)
-- [Wireshark](https://www.wireshark.org/) - Network traffic analysis
-- [curl](https://curl.se/) - CLI HTTP testing
-
----
-
-## Summary for AI Agent
-
-**Your job**: Keep this solver working as Cloudflare updates.
-
-**What to do**:
-1. When solver breaks, identify which component failed
-2. Inspect the Cloudflare JS to spot pattern changes
-3. Update the relevant Rust transformer/parser
-4. Test locally & validate output
-5. Commit with clear message explaining the change
-6. Monitor for next update
-
-**Key files to watch**:
-- `src/deobfuscator/transformers/strings.rs` (most frequent changes)
-- `src/deobfuscator/transformers/control_flow_flattening.rs`
-- `src/disassembler/instructions.rs` (if opcodes change)
-- `src/solver/vm_parser.rs` (if payload format changes)
-
-**Success criteria**:
-- Deobfuscated JS is readable
-- Bytecode disassembles without errors
-- VM produces valid token
-- Token passes Cloudflare validation
-
-Good luck! 🚀
+This guide deliberately replaces the earlier WAF-bypass material with an authorized testing and maintenance workflow. The observed traffic is valuable for understanding state transitions and diagnosing compatibility, but it is not a recipe for reproducing Cloudflare's protected challenge flow.
